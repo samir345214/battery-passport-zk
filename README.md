@@ -237,7 +237,7 @@ published with v1.0.0 must not be used with this version.
                   Verifier and Benchmark},
   howpublished = {\url{https://github.com/samir345214/battery-passport-zk}},
   year         = {2026},
-  note         = {DOI: to be assigned by Zenodo for release v2.0.0}
+  note         = {DOI:~\href{https://doi.org/10.5281/zenodo.23426541}{10.5281/zenodo.23426541}}
 }
 ```
 
