@@ -1,470 +1,383 @@
 #!/usr/bin/env python3
-# ============================================================
-#  Performance Benchmark — AIR-DEEP-FRI Battery Passport
+# ============================================================================
+#  Diagnostics and performance benchmark -- transparent AIR-DEEP-FRI STARK
+#  Battery Passport compliance over the Goldilocks field
 #
-#  Article:
-#    ZK-STARK over the Goldilocks Field for Verifiable Compliance
-#    of the European Battery Passport: AIR Arithmetization,
-#    NTT/INTT Interpolation, and Zero-Knowledge Parity Constraint
+#  Uses the prover / verifier of verify_battery_passport.py (same folder),
+#  so that exactly the same code is diagnosed and timed.
 #
-#  Measures prover and verifier times over 10 independent runs
-#  for two axes:
-#    Axis 1 — varying N (trace size), blowup = 8 fixed
-#    Axis 2 — varying blowup, N = 8 fixed (article instance)
+#  Part A -- Diagnostics
+#    A1  all 2^8 = 256 binary traces: accepted / rejected, violated
+#        constraint(s) and reason for every rejected trace
+#    A2  non-binary traces (random and targeted)
+#    A3  independence of the parity and mandatory layers
+#    A4  cheating provers on every invalid trace: division remainders
+#        dropped; false out-of-domain value Q(z) := Q*(z)
+#    A5  tampered proofs of the article trace
+#    A6  forged proofs without any witness: the attack accepted by the
+#        first version of the verifier (legacy/, no FRI layer and no
+#        opening of f, f_P, Q) is replayed against the corrected verifier
+#    A7  degree cost of a threshold rule "at least k of 5" (comparison)
+#  Part B -- Performance (mean +/- std over R runs)
+#    B1  article instance N = 8, blowup = 8
+#    B2  blowup in {4, 8, 16, 32} for N = 8
+#    B3  N in {8, 16, 32} for blowup = 8 (generalised layout: mandatory
+#        criteria at g^0, g^1, g^(N-1), optional criteria at g^2..g^(N-2))
 #
-#  Full protocol: lambda* = 22 FRI queries per proof.
-#
-#  Experimental environment (article):
-#    macOS Monterey 12.7.6 (21H1320)
-#    Intel Core i7 dual-core 2.2 GHz, 8 GB RAM DDR3 1600 MHz
-#    Python 3, exact arithmetic over F_p, no external libraries
-#
-#  Usage:
-#    python3 benchmark.py
-#
-#  Output:
-#    - Console table (mean +/- std, 10 runs)
-#    - LaTeX rows ready to paste into resultats_numeriques.tex
-#    - TikZ coordinates for the throughput figure (fig:throughput)
-#    - Key values summary for the article instance (N=8)
-#
-#  Requirements: Python 3.8+  (no external dependencies)
-#
-#  Encoding convention (matches verify_battery_passport.py):
-#    Field elements : little-endian 8 bytes (LE64)
-#    Merkle leaves  : SHA256(LE64(value))
-#    Fiat-Shamir    : SHA256(transcript)[:8] as LE64 mod p
-# ============================================================
+#  Usage
+#    python3 benchmark.py                 diagnostics + performance (10 runs)
+#    python3 benchmark.py --diag          diagnostics only
+#    python3 benchmark.py --perf          performance only
+#    python3 benchmark.py --runs 20       number of timed runs
+#    python3 benchmark.py --list          list the 256 traces one by one
+#  Exit code: 0 if every diagnostic matches the compliance rule, 1 otherwise
+# ============================================================================
 
-import time, math, struct, hashlib, statistics
+import copy
+import platform
+import random
+import statistics
+import sys
+import time
+from collections import Counter
+from itertools import product
 
-# ============================================================
-# Goldilocks field parameters
-# ============================================================
+import verify_battery_passport as bp
 
-p = 2**64 - 2**32 + 1   # Goldilocks prime
-# ord_p(2) = 192; subgroup generators are powers of 2
-# For N*blowup | 192: h = 2^(192/(N*blowup)), g = h^blowup
+p = bp.p
+FAILS = []
 
-# ============================================================
-# Arithmetic utilities
-# ============================================================
 
-def inv_mod(a, p):
-    """Modular inverse via Fermat's little theorem (p prime)."""
-    return pow(a, p - 2, p)
+def section(title):
+    print("\n" + "=" * 78 + "\n  " + title + "\n" + "=" * 78)
 
-def le64(x):
-    """Encode a field element as little-endian 8 bytes (LE64)."""
-    return struct.pack('<Q', int(x) % 2**64)
 
-def sha256(b):
-    """SHA-256 hash."""
-    return hashlib.sha256(b).digest()
+def result(label, cond):
+    print(("  [ok]   " if cond else "  [FAIL] ") + label)
+    if not cond:
+        FAILS.append(label)
 
-def fs_challenge(transcript: bytes, p: int) -> int:
-    """Fiat-Shamir challenge in F_p: SHA256(transcript)[:8] as LE64 mod p."""
-    return int.from_bytes(sha256(transcript)[:8], 'little') % p
 
-def fs_index(transcript: bytes, size: int) -> int:
-    """Fiat-Shamir index in [0, size): SHA256(transcript)[:8] as LE64 mod size."""
-    return int.from_bytes(sha256(transcript)[:8], 'little') % size
+def fmt(J):
+    return "".join(str(j) for j in J)
 
-# ============================================================
-# NTT/INTT over F_p
-# ============================================================
 
-def intt(vals, g, p):
-    """
-    Inverse NTT: interpolate a polynomial from its evaluations
-    at the N-th roots of unity {g^0, ..., g^(N-1)}.
-    Returns the coefficient vector [a_0, ..., a_{N-1}].
-    """
-    N = len(vals)
-    iN = inv_mod(N, p)
-    ig = inv_mod(g, p)
-    return [
-        (sum(vals[k] * pow(ig, i * k, p) for k in range(N)) * iN) % p
-        for i in range(N)
+# ============================================================================
+#  Part A -- Diagnostics
+# ============================================================================
+def a1_all_binary_traces(prm, listing):
+    section("A1  All 256 binary traces: verdict and diagnostic")
+    rows, by_cause, mismatches = [], Counter(), 0
+    for J in product((0, 1), repeat=8):
+        J = list(J)
+        compliant = bp.is_compliant(J, prm)
+        try:
+            proof, _ = bp.prove(J, prm)
+            ok, reason, _ = bp.verify(proof, prm)
+            verdict = "ACCEPTED" if ok else "REJECTED"
+            cause = "-" if ok else reason
+        except bp.AIRViolation as e:
+            verdict = "REJECTED"
+            cause = "; ".join(f"C{k}: {bp.diagnose(J, prm, k)}" for k in e.args[0])
+            by_cause[" + ".join(f"C{k}" for k in e.args[0])] += 1
+        expected = "ACCEPTED" if compliant else "REJECTED"
+        mismatches += verdict != expected
+        rows.append((J, verdict, cause, expected))
+
+    acc = [r for r in rows if r[1] == "ACCEPTED"]
+    print(f"\n  {len(acc)} accepted, {256 - len(acc)} rejected\n")
+    print("  Accepted traces (J0..J7)  |  # optional criteria satisfied")
+    for J, _, _, _ in acc:
+        print(f"    {fmt(J)}   |  {sum(J[2:7])}")
+    print("\n  Rejected traces grouped by violated constraint(s)")
+    print("    C3 = parity of the optional criteria is odd")
+    print("    C4 = at least one mandatory criterion (J0, J1, J7) equals 0")
+    for cause, n in sorted(by_cause.items()):
+        print(f"    {cause:<8} : {n:3d} traces")
+    if listing:
+        print("\n  Trace     Verdict    Reason")
+        for J, v, c, _ in rows:
+            print(f"  {fmt(J)}  {v:<9}  {c}")
+    else:
+        print("\n  (use --list to print the diagnostic of every trace)")
+    result("verdict = compliance rule for all 256 traces", mismatches == 0)
+    result("exactly 16 accepted traces (2^4 even-weight optional parts)", len(acc) == 16)
+    result("every accepted proof verifies, every rejected trace is stopped by the AIR",
+           all((v == "ACCEPTED") == bp.is_compliant(J, prm) for J, v, _, _ in rows))
+
+
+def a2_non_binary(prm, rng):
+    section("A2  Non-binary traces")
+    n, rejected_c1 = 300, 0
+    for _ in range(n):
+        J = [rng.randrange(p) for _ in range(8)]
+        A = bp.arithmetize(J, prm)
+        rejected_c1 += 1 in A["violated"]
+    result(f"{n} random traces in F_p^8 are all rejected by C1 ({rejected_c1}/{n})", rejected_c1 == n)
+    x = 2 * bp.inv(3) % p
+    J = [1, 1, 2, x, 0, 0, 0, 1]
+    P = [p - 1, 1] + [0] * 6
+    for i in range(2, 7):
+        P[i] = P[i - 1] * (1 - 2 * J[i]) % p
+    P[7] = 1
+    f, fP = bp.intt(J, prm.g), bp.intt(P, prm.g)
+    C = bp.constraint_polys(f, fP, prm)
+    viol = [k + 1 for k in range(4) if bp.pdivmod(C[k], prm.Z[k])[1]]
+    print("  Targeted attack: J2 = 2, J3 = 2/3, so (1 - 2 J2)(1 - 2 J3) = (-3)(-1/3) = 1;")
+    print(f"  the accumulator reaches P6 = 1 and only these constraints fail: {['C%d' % k for k in viol]}")
+    result("the targeted non-binary attack is caught by C1 alone", viol == [1])
+
+
+def a3_layers(prm):
+    section("A3  Independence of the two layers")
+    par_ok = mand_ok = True
+    for J in product((0, 1), repeat=8):
+        A = bp.arithmetize(list(J), prm)
+        v = set(A["violated"])
+        par_ok &= (3 not in v) == (sum(J[2:7]) % 2 == 0)
+        mand_ok &= (4 not in v) == (J[0] == J[1] == J[7] == 1)
+    result("parity layer {C1,C2,C3} accepts exactly the even-parity traces, whatever J0, J1, J7", par_ok)
+    result("mandatory layer {C4} accepts exactly the traces with J0 = J1 = J7 = 1", mand_ok)
+
+
+def a4_cheating(prm):
+    section("A4  Cheating provers on every invalid trace")
+    invalid = [list(J) for J in product((0, 1), repeat=8) if not bp.is_compliant(list(J), prm)]
+    for mode, text in (("drop_remainder", "division remainders dropped (Q a polynomial, wrong at z)"),
+                       ("fake_ood", "Q(z) replaced by Q*(z) (OOD check passed, F not a polynomial)")):
+        stage = Counter()
+        for J in invalid:
+            proof, _ = bp.prove(J, prm, cheat=mode)
+            ok, reason, _ = bp.verify(proof, prm)
+            stage["ACCEPTED (soundness failure)" if ok else reason.split(" (query")[0]] += 1
+        print(f"\n  {mode}: {text}")
+        for reason, k in stage.most_common():
+            print(f"    {k:3d} / {len(invalid)}  {reason}")
+        result(f"all {len(invalid)} '{mode}' proofs are rejected",
+               "ACCEPTED (soundness failure)" not in stage)
+    proof, _ = bp.prove(prm.default_trace(), prm, cheat="fake_ood")
+    ok, reason, _ = bp.verify(proof, prm)
+    print(f"\n  fake_ood on the compliant article trace with Q(z) unchanged -> "
+          f"{'ACCEPTED' if ok else 'REJECTED'} (expected: accepted, Q*(z) = Q(z) already)")
+    result("fake_ood mode is harmless on a compliant trace (control)", ok)
+
+
+def a5_tampering(prm):
+    section("A5  Tampered proofs of the article trace")
+    proof, _ = bp.prove(prm.default_trace(), prm)
+    ok, _, _ = bp.verify(proof, prm)
+    result("untampered proof is accepted", ok)
+
+    def flip(b):
+        return bytes([b[0] ^ 1]) + b[1:]
+
+    def add1(lst, i):
+        lst[i] = (lst[i] + 1) % p
+
+    cases = [
+        ("Q(z) + 1", lambda q: add1(q["ood"], 4)),
+        ("f(z) + 1", lambda q: add1(q["ood"], 0)),
+        ("f_P(gz) + 1", lambda q: add1(q["ood"], 3)),
+        ("root(T) modified", lambda q: q.update(root_T=flip(q["root_T"]))),
+        ("root(C) modified", lambda q: q.update(root_C=flip(q["root_C"]))),
+        ("root(F_1) modified", lambda q: q["layer_roots"].__setitem__(0, flip(q["layer_roots"][0]))),
+        ("final constant + 1", lambda q: q.update(final=(q["final"] + 1) % p)),
+        ("f(x) of query 1 + 1", lambda q: add1(q["queries"][0]["T"]["values"], 0)),
+        ("Q(-x) of query 3 + 1", lambda q: add1(q["queries"][2]["C"]["values"], 1)),
+        ("F_2 value of query 5 + 1", lambda q: add1(q["queries"][4]["layers"][1]["values"], 0)),
+        ("Merkle sibling of query 7 (T) modified",
+         lambda q: q["queries"][6]["T"]["path"].__setitem__(3, flip(q["queries"][6]["T"]["path"][3]))),
+        ("position of query 2 changed", lambda q: q["queries"][1].update(j=(q["queries"][1]["j"] + 1) % 32)),
+        ("last query removed", lambda q: q["queries"].pop()),
     ]
-
-def poly_eval_domain(coeffs, gen, p, size):
-    """Evaluate a polynomial at all points {gen^0, ..., gen^(size-1)}."""
-    return [
-        sum(coeffs[i] * pow(gen, i * k, p) for i in range(len(coeffs))) % p
-        for k in range(size)
-    ]
-
-def poly_eval_pt(coeffs, x, p):
-    """Evaluate a polynomial at a single point x (Horner's method)."""
-    r, xi = 0, 1
-    for c in coeffs:
-        r = (r + c * xi) % p
-        xi = (xi * x) % p
-    return r
-
-# ============================================================
-# Merkle tree (SHA-256, LE64 encoding)
-# ============================================================
-
-def merkle_root(evals):
-    """
-    Compute the Merkle root over field evaluations.
-    Leaf i   = SHA256(LE64(evals[i])).
-    Parent   = SHA256(left || right).
-    Odd node : last node duplicated.
-    """
-    nodes = [sha256(le64(v)) for v in evals]
-    while len(nodes) > 1:
-        if len(nodes) % 2:
-            nodes.append(nodes[-1])
-        nodes = [sha256(nodes[i] + nodes[i + 1])
-                 for i in range(0, len(nodes), 2)]
-    return nodes[0]
-
-def merkle_path(evals, idx):
-    """Return the Merkle authentication path for leaf index idx."""
-    nodes = [sha256(le64(v)) for v in evals]
-    path = []
-    while len(nodes) > 1:
-        if len(nodes) % 2:
-            nodes.append(nodes[-1])
-        path.append(nodes[idx ^ 1])
-        nodes = [sha256(nodes[i] + nodes[i + 1])
-                 for i in range(0, len(nodes), 2)]
-        idx //= 2
-    return path
-
-def merkle_verify(root, idx, value, path):
-    """Verify a Merkle authentication path."""
-    node = sha256(le64(value))
-    for s in path:
-        node = sha256(node + s) if idx % 2 == 0 else sha256(s + node)
-        idx //= 2
-    return node == root
-
-# ============================================================
-# Compliance trace construction
-# ============================================================
-
-def build_trace(N):
-    """
-    Build a compliance trace J of length N satisfying:
-      Part A : J[0] = J[1] = J[-1] = 1  (mandatory criteria)
-      Part B : prod(1-2*J[i], i=2..N-2) = 1  (even parity)
-               sum(J[i], i=2..N-2) >= 2       (threshold)
-
-    For N=8 : exact article trace J = [1,1,1,0,1,0,0,1].
-    For N!=8 : minimal compliant synthetic trace
-               (exactly 2 optional criteria satisfied).
-    Requires N >= 5 (at least 2 optional indices 2..N-2).
-    """
-    if N == 8:
-        # Exact article trace (EU Battery Passport regulatory instance)
-        return [1, 1, 1, 0, 1, 0, 0, 1]
-
-    # Synthetic compliant trace for generic instances (N != 8)
-    opt_indices = list(range(2, N - 1))   # optional criteria: indices 2..N-2
-    if len(opt_indices) < 2:
-        raise ValueError(
-            f"N={N}: only {len(opt_indices)} optional index(es) available "
-            f"(indices 2..{N-2}). Part B (threshold >= 2) requires N >= 5."
-        )
-    J = [0] * N
-    J[0] = 1; J[1] = 1; J[-1] = 1        # mandatory
-    J[opt_indices[0]] = 1                  # 2 optional satisfied
-    J[opt_indices[1]] = 1                  # -> even parity AND threshold >= 2
-    return J
-
-# ============================================================
-# Full AIR-DEEP-FRI protocol (prover + verifier)
-# ============================================================
-
-def run_full(N, blowup):
-    """
-    Execute one complete AIR-DEEP-FRI proof generation and verification.
-
-    Parameters
-    ----------
-    N      : trace length (must satisfy N*blowup | 192)
-    blowup : domain extension factor (|L| = N * blowup)
-
-    Returns
-    -------
-    t_gen : prover time in milliseconds
-    t_ver : verifier time in milliseconds
-    ok    : True if Q*(z) = Q(z) AND all lambda* Merkle paths verify
-    """
-    size_L = N * blowup
-
-    # Subgroup generators: h of order size_L, g of order N
-    # Uses ord_p(2) = 192; requires N*blowup | 192
-    h_gen = pow(2, 192 // size_L, p)
-    g_gen = pow(2, 192 // N, p)
-
-    G     = [pow(g_gen, k, p) for k in range(N)]
-    L_set = set(pow(h_gen, i, p) for i in range(size_L))
-
-    J = build_trace(N)
-
-    # ----------------------------------------------------------
-    # PROVER
-    # ----------------------------------------------------------
-    t0 = time.perf_counter()
-
-    # Step 1: auxiliary trace P (parity accumulator)
-    # P[i] = prod(1 - 2*J[k], k=1..i) tracks the running parity
-    P = [0] * N
-    P[0] = (1 - 2 * J[0]) % p
-    P[1] = 1
-    for i in range(2, N - 1):
-        P[i] = (P[i - 1] * ((1 - 2 * J[i]) % p)) % p
-    P[N - 1] = P[N - 2]
-
-    # Step 2: INTT — interpolate f and f_P from trace values
-    f_c  = intt(J, g_gen, p)
-    fP_c = intt(P, g_gen, p)
-
-    # Step 3: evaluate f and f_P over the extended domain L
-    f_L  = poly_eval_domain(f_c,  h_gen, p, size_L)
-    fP_L = poly_eval_domain(fP_c, h_gen, p, size_L)
-
-    # Step 4: Merkle commitments (Round 0)
-    root_f  = merkle_root(f_L)
-    root_fP = merkle_root(fP_L)
-    tr1 = root_f + root_fP
-
-    # Step 5: batching coefficients alpha_k (Round 1, Fiat-Shamir)
-    a1 = fs_challenge(tr1, p)
-    a2 = fs_challenge(tr1 + le64(a1), p)
-    a3 = fs_challenge(tr1 + le64(a1) + le64(a2), p)
-    tr2 = tr1 + le64(a1) + le64(a2) + le64(a3)
-    a4 = fs_challenge(tr2, p)
-    tr2 = tr2 + le64(a4)
-
-    # Step 6: out-of-domain point z (Round 2, Fiat-Shamir)
-    c = 0
-    while True:
-        zc = fs_challenge(tr2 + le64(c), p)
-        if zc not in L_set:
-            z = zc
-            break
-        c += 1
-
-    # Step 7: evaluations at z and gz (Round 3)
-    gz   = (g_gen * z) % p
-    f_z  = poly_eval_pt(f_c,  z,  p)
-    fP_z = poly_eval_pt(fP_c, z,  p)
-    f_gz  = poly_eval_pt(f_c,  gz, p)
-    fP_gz = poly_eval_pt(fP_c, gz, p)
-
-    # Quotient polynomial Q(z) = sum_k alpha_k * C_k(z) / Z_{D_k}(z)
-    C1_z = (f_z * (f_z - 1)) % p
-    Z1_z = (pow(z, N, p) - 1) % p
-
-    C2_z = (fP_gz - fP_z * ((1 - 2 * f_gz) % p)) % p
-    Z2_z = 1
-    for i in range(1, max(2, N - 2)):
-        Z2_z = (Z2_z * (z - G[i])) % p
-
-    C3_z = (fP_z - (p - 1)) % p
-    Z3_z = (z - 1) % p
-
-    C4_z = (fP_z - 1) % p
-    Z4_z = (z - G[N - 1]) % p
-
-    Q1_z = (a1 * C1_z * inv_mod(Z1_z, p)) % p if Z1_z else 0
-    Q2_z = (a2 * C2_z * inv_mod(Z2_z, p)) % p if Z2_z else 0
-    Q3_z = (a3 * C3_z * inv_mod(Z3_z, p)) % p if Z3_z else 0
-    Q4_z = (a4 * C4_z * inv_mod(Z4_z, p)) % p if Z4_z else 0
-    Q_z  = (Q1_z + Q2_z + Q3_z + Q4_z) % p
-
-    # Step 8: Q over L and DEEP polynomial (Round 4)
-    def eval_Q(x):
-        """Evaluate the combined quotient polynomial Q at point x."""
-        gx   = (g_gen * x) % p
-        fx   = poly_eval_pt(f_c,  x,  p)
-        fPx  = poly_eval_pt(fP_c, x,  p)
-        fgx  = poly_eval_pt(f_c,  gx, p)
-        fPgx = poly_eval_pt(fP_c, gx, p)
-        C1x  = (fx * (fx - 1)) % p
-        Z1x  = (pow(x, N, p) - 1) % p
-        C2x  = (fPgx - fPx * ((1 - 2 * fgx) % p)) % p
-        Z2x  = 1
-        for i in range(1, max(2, N - 2)):
-            Z2x = (Z2x * (x - G[i])) % p
-        C3x = (fPx - (p - 1)) % p
-        Z3x = (x - 1) % p
-        C4x = (fPx - 1) % p
-        Z4x = (x - G[N - 1]) % p
-        q = 0
-        if Z1x: q = (q + a1 * C1x * inv_mod(Z1x, p)) % p
-        if Z2x: q = (q + a2 * C2x * inv_mod(Z2x, p)) % p
-        if Z3x: q = (q + a3 * C3x * inv_mod(Z3x, p)) % p
-        if Z4x: q = (q + a4 * C4x * inv_mod(Z4x, p)) % p
-        return q
-
-    Q_L    = [eval_Q(pow(h_gen, i, p)) for i in range(size_L)]
-    # DEEP(x) = (Q(x) - Q(z)) / (x - z)  -- exact polynomial division
-    DEEP_L = [
-        (Q_L[i] - Q_z) * inv_mod((pow(h_gen, i, p) - z) % p, p) % p
-        for i in range(size_L)
-    ]
-    root_DEEP = merkle_root(DEEP_L)
-
-    # Step 9: FRI folding coefficient and lambda* = 22 queries (Rounds 5-6)
-    tr3   = tr2 + le64(f_z) + le64(fP_z) + le64(f_gz) + le64(fP_gz) + le64(Q_z)
-    tr4   = tr3 + root_DEEP
-    beta1 = fs_challenge(tr4, p)
-    tr5   = tr4 + le64(beta1)
-
-    lambda_star = 22   # optimal number of FRI queries (Theorem soundness-global)
-    queries = []
-    tr_cur  = tr5
-    for r in range(lambda_star):
-        iota_r = fs_index(tr_cur + le64(r), size_L)
-        path_r = merkle_path(DEEP_L, iota_r)
-        queries.append((iota_r, DEEP_L[iota_r], path_r))
-        tr_cur = tr_cur + le64(iota_r)
-
-    t1    = time.perf_counter()
-    t_gen = (t1 - t0) * 1000   # milliseconds
-
-    # ----------------------------------------------------------
-    # VERIFIER
-    # Recomputes all Fiat-Shamir challenges from public commitments,
-    # checks Q*(z) = Q(z), and verifies all lambda* Merkle paths.
-    # ----------------------------------------------------------
-    t2 = time.perf_counter()
-
-    # Recompute challenges from transcript
-    tr1v = root_f + root_fP
-    a1v  = fs_challenge(tr1v, p)
-    a2v  = fs_challenge(tr1v + le64(a1v), p)
-    a3v  = fs_challenge(tr1v + le64(a1v) + le64(a2v), p)
-    tr2v = tr1v + le64(a1v) + le64(a2v) + le64(a3v)
-    a4v  = fs_challenge(tr2v, p)
-    tr2v = tr2v + le64(a4v)
-
-    c = 0
-    while True:
-        zc = fs_challenge(tr2v + le64(c), p)
-        if zc not in L_set:
-            zv = zc
-            break
-        c += 1
-
-    # Recompute Q*(z) from claimed evaluations
-    C1_zv = (f_z * (f_z - 1)) % p
-    Z1_zv = (pow(zv, N, p) - 1) % p
-    C2_zv = (fP_gz - fP_z * ((1 - 2 * f_gz) % p)) % p
-    Z2_zv = 1
-    for i in range(1, max(2, N - 2)):
-        Z2_zv = (Z2_zv * (zv - G[i])) % p
-    C3_zv = (fP_z - (p - 1)) % p
-    Z3_zv = (zv - 1) % p
-    C4_zv = (fP_z - 1) % p
-    Z4_zv = (zv - G[N - 1]) % p
-
-    Q1_zv = (a1v * C1_zv * inv_mod(Z1_zv, p)) % p if Z1_zv else 0
-    Q2_zv = (a2v * C2_zv * inv_mod(Z2_zv, p)) % p if Z2_zv else 0
-    Q3_zv = (a3v * C3_zv * inv_mod(Z3_zv, p)) % p if Z3_zv else 0
-    Q4_zv = (a4v * C4_zv * inv_mod(Z4_zv, p)) % p if Z4_zv else 0
-    Qstar = (Q1_zv + Q2_zv + Q3_zv + Q4_zv) % p
-
-    # Verify all lambda* = 22 Merkle authentication paths
-    all_ok = (Qstar == Q_z)
-    for iota_r, deep_val, path_r in queries:
-        all_ok = all_ok and merkle_verify(root_DEEP, iota_r, deep_val, path_r)
-
-    t3    = time.perf_counter()
-    t_ver = (t3 - t2) * 1000   # milliseconds
-
-    return t_gen, t_ver, all_ok
-
-# ============================================================
-# Benchmark runner
-# ============================================================
-
-RUNS = 10   # number of independent runs per configuration
-
-print("=" * 72)
-print("  BENCHMARK  AIR-DEEP-FRI — Battery Passport")
-print("  10 runs per configuration | Python 3 | Goldilocks F_p")
-print(f"  Full protocol: lambda* = 22 FRI queries")
-print("=" * 72)
-
-# ----------------------------------------------------------
-# Axis 1: varying N, blowup = 8 fixed
-# Constraint: N * 8 must divide 192 = ord_p(2)
-#             AND N >= 5 (at least 2 optional criteria)
-# Valid values: N in {6, 8, 12, 24}
-# ----------------------------------------------------------
-print("\n--- Axis 1: varying N  (blowup = 8 fixed) ---")
-print(f"{'N':>5} | {'|L|':>5} | {'Gen mean (ms)':>14} | "
-      f"{'Gen std':>8} | {'Ver mean (ms)':>14} | {'Ver std':>8}")
-print("-" * 65)
-
-res_N = []
-for N in [6, 8, 12, 24]:
-    blowup = 8
-    if 192 % (N * blowup) != 0:
-        continue
-    gs = []; vs = []
-    for _ in range(RUNS):
-        tg, tv, ok = run_full(N, blowup)
-        assert ok, f"Verification failed for N={N}"
-        gs.append(tg); vs.append(tv)
-    mg = statistics.mean(gs); sg = statistics.stdev(gs)
-    mv = statistics.mean(vs); sv = statistics.stdev(vs)
-    res_N.append((N, N * blowup, mg, sg, mv, sv))
-    mark = "  <- article" if N == 8 else ""
-    print(f"{N:>5} | {N*blowup:>5} | {mg:>14.3f} | "
-          f"{sg:>8.3f} | {mv:>14.4f} | {sv:>8.4f}{mark}")
-
-# ----------------------------------------------------------
-# Axis 2: varying blowup, N = 8 fixed
-# Constraint: 8 * blowup must divide 192 = ord_p(2)
-# Valid values: blowup in {4, 8, 12, 24}
-# ----------------------------------------------------------
-print("\n--- Axis 2: varying blowup  (N = 8 fixed) ---")
-print(f"{'Blowup':>7} | {'|L|':>5} | {'Gen mean (ms)':>14} | "
-      f"{'Gen std':>8} | {'Ver mean (ms)':>14} | {'Ver std':>8}")
-print("-" * 65)
-
-res_B = []
-N = 8
-for blowup in [4, 8, 12, 24]:
-    if 192 % (N * blowup) != 0:
-        continue
-    gs = []; vs = []
-    for _ in range(RUNS):
-        tg, tv, ok = run_full(N, blowup)
-        assert ok, f"Verification failed for blowup={blowup}"
-        gs.append(tg); vs.append(tv)
-    mg = statistics.mean(gs); sg = statistics.stdev(gs)
-    mv = statistics.mean(vs); sv = statistics.stdev(vs)
-    res_B.append((blowup, N * blowup, mg, sg, mv, sv))
-    mark = "  <- article" if blowup == 8 else ""
-    print(f"{blowup:>7} | {N*blowup:>5} | {mg:>14.3f} | "
-          f"{sg:>8.3f} | {mv:>14.4f} | {sv:>8.4f}{mark}")
-
-print("\n<- article  =  N=8, blowup=8 instance from the paper")
-print("✓  All assertions passed  (Q*(z) = Q(z)  AND  Merkle valid)")
+    all_rej = True
+    for name, mutate in cases:
+        t = copy.deepcopy(proof)
+        mutate(t)
+        ok, reason, _ = bp.verify(t, prm)
+        all_rej &= not ok
+        print(f"    {name:<40} -> {'ACCEPTED' if ok else 'REJECTED'}: {reason}")
+    result("every tampered proof is rejected", all_rej)
 
 
+def a6_forgery(prm, rng, trials=200):
+    section("A6  Forged proofs without any witness")
+    # (a) the attack against the first version of the verifier
+    import importlib.util
+    import os
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "legacy",
+                        "verify_battery_passport_v1.py")
+    if os.path.exists(path):
+        spec = importlib.util.spec_from_file_location("bp_v1", path)
+        v1 = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(v1)
+        prm1 = v1.Params()
+        acc1 = 0
+        for _ in range(trials):
+            root_f, root_fP = rng.getrandbits(256).to_bytes(32, "little"), rng.getrandbits(256).to_bytes(32, "little")
+            t = root_f + root_fP
+            alphas = []
+            for _ in range(4):
+                a = v1.H(t) % p
+                alphas.append(a)
+                t += v1.le64(a)
+            c = 0
+            while True:
+                z = v1.H(t + v1.le64(c)) % p
+                if z not in prm1.L_set:
+                    break
+                c += 1
+            ev = [rng.randrange(p) for _ in range(4)]
+            Cz = v1.constraint_values(*ev)
+            Qz = sum(a * cz * v1.inv(v1.peval(zk, z)) for a, cz, zk in zip(alphas, Cz, prm1.Z)) % p
+            DEEP_L = [rng.randrange(p) for _ in range(prm1.size_L)]
+            layers = v1.merkle_layers(DEEP_L)
+            tr5 = t + v1.le64(z) + b"".join(v1.le64(v) for v in ev) + v1.le64(Qz) + layers[-1][0]
+            beta = v1.H(tr5) % p
+            tr6 = tr5 + v1.le64(beta)
+            queries = []
+            for r in range(1, prm1.lam + 1):
+                c = 0
+                while True:
+                    iota = v1.H(tr6 + v1.le64(r) + v1.le64(c)) % prm1.size_L
+                    if iota not in prm1.G_idx:
+                        break
+                    c += 1
+                queries.append({"iota": iota, "value": DEEP_L[iota], "path": v1.merkle_path(layers, iota)})
+            forged = {"root_f": root_f, "root_fP": root_fP, "fz": ev[0], "fPz": ev[1], "fgz": ev[2],
+                      "fPgz": ev[3], "Qz": Qz, "root_DEEP": layers[-1][0], "beta": beta, "queries": queries}
+            acc1 += v1.verify(forged, prm1)[0]
+        print(f"  (a) first verifier (legacy/): {acc1}/{trials} forged proofs ACCEPTED")
+        print("      -> no committed FRI layer and no opening of f, f_P, Q: the DEEP values are")
+        print("         never tied to the trace, and Q(z) can be chosen equal to Q*(z).")
+        result("the legacy verifier is shown to accept forged proofs (motivates the correction)",
+               acc1 == trials)
+    else:
+        print("  (a) legacy/verify_battery_passport_v1.py not found: skipped")
 
-# ============================================================
-# Key values summary (article instance N=8, blowup=8)
-# ============================================================
-print("\n=== Key values — Article instance  (N=8, |L|=64) ===")
-for N, sL, mg, sg, mv, sv in res_N:
-    if N == 8:
-        d_prv = 1000.0 / mg
-        d_ver = 1000.0 / mv
-        ratio = mg / mv
-        print(f"  Prover generation  : {mg:.3f} +/- {sg:.3f} ms")
-        print(f"  Verifier time      : {mv:.4f} +/- {sv:.4f} ms")
-        print(f"  Prover throughput  : {d_prv:.2f} op/s")
-        print(f"  Verifier throughput: {d_ver:.2f} op/s")
-        print(f"  Prover/Verifier    : {ratio:.1f}x  (verifier is faster)")
+    # (b) the same forgery strategy against the corrected verifier
+    n = prm.size_L
+    variants = {
+        "random values on L": lambda: [[rng.randrange(p) for _ in range(n)] for _ in range(3)],
+        "random low-degree f, f_P (deg 7), Q (deg 8)": lambda: [
+            bp.ntt([rng.randrange(p) for _ in range(d + 1)], prm.h, n) for d in (7, 7, 8)],
+    }
+    for name, gen in variants.items():
+        stage = Counter()
+        for _ in range(trials):
+            proof, _ = bp.prove(None, prm, cheat="forge", forged=gen())
+            ok, reason, _ = bp.verify(proof, prm)
+            stage["ACCEPTED (soundness failure)" if ok else reason.split(" (query")[0]] += 1
+        print(f"\n  (b) corrected verifier, forgery with {name}, OOD check passed by construction")
+        for reason, k in stage.most_common():
+            print(f"    {k:3d} / {trials}  {reason}")
+        result(f"all {trials} forged proofs ({name}) are rejected",
+               "ACCEPTED (soundness failure)" not in stage)
+
+
+def a7_threshold_rule(prm):
+    section("A7  Cost of a threshold rule 'at least k of 5 optional criteria' (comparison)")
+    # additive counter S_1 = 0, S_i = S_(i-1) + J_i (i = 2..6); S_0, S_7 free (set to 0)
+    print("  Parity:    transition deg 2, final condition f_P - 1 at g^6 (linear) -> deg Q = 8")
+    ok_all = True
+    for k in (1, 2, 3, 4, 5):
+        J = [1, 1] + [1] * k + [0] * (5 - k) + [1]          # exactly k optional criteria
+        S = [0] * 8
+        for i in range(2, 7):
+            S[i] = S[i - 1] + J[i]
+        fS = bp.intt(S, prm.g)
+        B = [1]
+        for s in range(k, 6):
+            B = bp.pmul(B, bp.psub(fS, [s]))
+        q, r = bp.pdivmod(B, bp.vanishing([prm.G[6]]))
+        f = bp.intt(J, prm.g)
+        T = bp.psub(bp.psub(bp.pshift(fS, prm.g), fS), bp.pshift(f, prm.g))
+        qt, rt = bp.pdivmod(T, bp.vanishing([prm.G[i] for i in range(1, 6)]))
+        d_F = 1
+        while d_F <= bp.deg(q):
+            d_F *= 2
+        print(f"  k = {k}: boundary prod_(s={k}..5)(f_S - s) has degree {bp.deg(B)}, quotient degree "
+              f"{bp.deg(q)} (expected {7 * (6 - k) - 1}); transition quotient degree {bp.deg(qt)}; "
+              f"|L| at rate 1/8 >= {8 * d_F}")
+        ok_all &= (not r and not rt and bp.deg(q) == 7 * (6 - k) - 1)
+    result("threshold boundary constraint is exact and has quotient degree 7(6-k) - 1 (27 for k = 2)", ok_all)
+
+
+# ============================================================================
+#  Part B -- Performance
+# ============================================================================
+def timed(fn, runs):
+    out = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        fn()
+        out.append((time.perf_counter() - t0) * 1000)
+    return statistics.mean(out), (statistics.stdev(out) if runs > 1 else 0.0)
+
+
+def bench(prm, runs):
+    J = prm.default_trace()
+    proof, _ = bp.prove(J, prm)
+    assert bp.verify(proof, prm)[0]
+    tp, sp = timed(lambda: bp.prove(J, prm), runs)
+    tv, sv = timed(lambda: bp.verify(proof, prm), runs)
+    return tp, sp, tv, sv, len(bp.serialize(proof))
+
+
+def perf(runs):
+    section(f"B  Performance ({runs} runs per configuration, times in ms, mean +/- std)")
+    print(f"  Python {platform.python_version()} on {platform.platform()}")
+    print(f"  Processor: {platform.processor() or platform.machine()}")
+    print("  Pure-Python reference implementation, exact F_p arithmetic, no external library.")
+
+    print("\n  B1  Article instance (N = 8, blowup = 8, lambda* = 20)")
+    prm = bp.Params(8, 8)
+    tp, sp, tv, sv, size = bench(prm, runs)
+    print(f"    proving {tp:8.3f} +/- {sp:.3f}   verification {tv:7.3f} +/- {sv:.3f}"
+          f"   ratio {tp / tv:5.1f}   proof {size} B")
+
+    print("\n  B2  Blowup (N = 8)")
+    print("    blowup  |L|  lambda*  proving (ms)        verification (ms)   proof (B)")
+    for b in (4, 8, 16, 32):
+        prm = bp.Params(8, b)
+        tp, sp, tv, sv, size = bench(prm, runs)
+        print(f"    {b:6d} {prm.size_L:4d} {prm.lam:8d}  {tp:8.3f} +/- {sp:6.3f}  {tv:7.3f} +/- {sv:6.3f}  {size:9d}")
+
+    print("\n  B3  Trace length N (blowup = 8; generalised layout, see header)")
+    print("    N    |L|  deg Q  lambda*  proving (ms)        verification (ms)   proof (B)")
+    for N in (8, 16, 32):
+        prm = bp.Params(N, 8)
+        tp, sp, tv, sv, size = bench(prm, runs)
+        print(f"    {N:3d} {prm.size_L:5d} {prm.deg_Q:6d} {prm.lam:8d}  {tp:8.3f} +/- {sp:6.3f}  "
+              f"{tv:7.3f} +/- {sv:6.3f}  {size:9d}")
+
+
+# ============================================================================
+def main():
+    args = sys.argv[1:]
+    runs = 10
+    if "--runs" in args:
+        runs = int(args[args.index("--runs") + 1])
+    do_diag = "--perf" not in args
+    do_perf = "--diag" not in args
+    prm = bp.Params(8, 8)
+    rng = random.Random(2026)
+    print("Transparent AIR-DEEP-FRI Battery Passport -- diagnostics and benchmark")
+    if do_diag:
+        a1_all_binary_traces(prm, "--list" in args)
+        a2_non_binary(prm, rng)
+        a3_layers(prm)
+        a4_cheating(prm)
+        a5_tampering(prm)
+        a6_forgery(prm, rng)
+        a7_threshold_rule(prm)
+        section("DIAGNOSTIC SUMMARY")
+        print("  all diagnostics consistent with the compliance rule" if not FAILS
+              else "  FAILED: " + "; ".join(FAILS))
+    if do_perf:
+        perf(runs)
+    sys.exit(1 if FAILS else 0)
+
+
+if __name__ == "__main__":
+    main()
